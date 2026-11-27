@@ -142,6 +142,13 @@ class Claude(Model):
     cache_system_prompt: Optional[bool] = False
     extended_cache_time: Optional[bool] = False
     cache_tools: bool = False
+    # Fine-grained tool streaming: on streamed requests, set ``eager_input_streaming`` on every
+    # client tool so its input arrives as it is generated. Without it the API buffers a tool
+    # input to validate it and sends no event meanwhile, so one long argument is a long silence
+    # that a read timeout takes for a dead connection. With it the API no longer validates the
+    # input: a call cut off at ``max_tokens`` can arrive with arguments missing, which the
+    # function's own argument validation then reports back to the model.
+    eager_input_streaming: bool = False
     # Optional multi-block system prompt with per-block cache control.
     # Appended after the agent-built system message in the Anthropic ``system``
     # array. See SystemPromptBlock for cache/ttl semantics. May be a list, or a
@@ -612,6 +619,23 @@ class Claude(Model):
         if self.cache_tools and "tools" in request_kwargs and request_kwargs["tools"]:
             request_kwargs["tools"][-1]["cache_control"] = {"type": "ephemeral"}
 
+    def _apply_eager_input_streaming(self, request_kwargs: Dict[str, Any]) -> None:
+        """Mark client tools for fine-grained streaming on a streamed request.
+
+        Only tools the caller defines (they carry ``input_schema`` and no server ``type``) take the
+        field. Strict tools are left buffered: their guarantee is a validated input. New dicts, so
+        a tool list shared with a non-streamed request is not changed.
+        """
+        tools = request_kwargs.get("tools")
+        if not self.eager_input_streaming or not tools:
+            return
+        request_kwargs["tools"] = [
+            {**tool, "eager_input_streaming": True}
+            if isinstance(tool, dict) and "input_schema" in tool and "type" not in tool and not tool.get("strict")
+            else tool
+            for tool in tools
+        ]
+
     def _build_system(self, system_message: str) -> List[Dict[str, Any]]:
         """Assemble the Anthropic ``system`` array.
 
@@ -824,6 +848,7 @@ class Claude(Model):
         request_kwargs = self._prepare_request_kwargs(
             system_message, tools=tools, response_format=response_format, messages=messages
         )
+        self._apply_eager_input_streaming(request_kwargs)
 
         try:
             # Beta features
@@ -934,6 +959,7 @@ class Claude(Model):
             request_kwargs = self._prepare_request_kwargs(
                 system_message, tools=tools, response_format=response_format, messages=messages
             )
+            self._apply_eager_input_streaming(request_kwargs)
 
             if self._has_beta_features(response_format=response_format, tools=tools):
                 assistant_message.metrics.start_timer()
